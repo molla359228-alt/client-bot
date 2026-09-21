@@ -1,0 +1,310 @@
+import logging
+import re
+import sqlite3
+import os
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    ContextTypes, MessageHandler, filters
+)
+import pytz
+
+# ================== কনফিগারেশন ==================
+BOT_TOKEN = "8831118670:AAEmmtkN7uOfMDYM-w72H2gj518zCztptug"
+OWNER_ID  = 7495790113
+
+BD_TZ = pytz.timezone("Asia/Dhaka")
+DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clients.db")
+
+# ================== হেল্পার ==================
+def now_bd():
+    return datetime.now(BD_TZ)
+
+def fmt_dt(dt):
+    return dt.strftime("%d %b %Y, %I:%M %p")
+
+def is_owner(user_id):
+    return user_id == OWNER_ID
+
+def normalize(value):
+    """নাম্বার/ইউজারনেম নরমালাইজ - @, +88, স্পেস, ড্যাশ বাদ"""
+    if not value:
+        return ""
+    v = value.strip().lower()
+    v = v.lstrip("@")
+    v = v.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+    if v.startswith("+880"):
+        v = v[4:]
+    elif v.startswith("880"):
+        v = v[3:]
+    elif v.startswith("+88"):
+        v = v[3:]
+    elif v.startswith("88") and len(v) > 11:
+        v = v[2:]
+    return v
+
+def is_valid_input(text):
+    """
+    টেক্সট নাম্বার বা ইউজারনেম কিনা যাচাই:
+    - Instagram username: ডট, আন্ডারস্কোর, সংখ্যা সহ (২-৩০ অক্ষর)
+    - @username (ডট সহ) যেমন: @suliaeva.art
+    - নাম্বার (১০-১৫ ডিজিট, +88, 88, +880 সহ)
+    """
+    if not text:
+        return False
+    text = text.strip()
+    if len(text) > 50 or len(text) < 2:
+        return False
+
+    # ১. @username প্যাটার্ন (ডট, আন্ডারস্কোর সহ)
+    if text.startswith("@"):
+        username = text[1:]
+        if 2 <= len(username) <= 30:
+            if re.match(r'^[a-zA-Z0-9_.]+$', username):
+                return True
+
+    # ২. username প্যাটার্ন (@ ছাড়া, ডট সহ)
+    if re.match(r'^[a-zA-Z0-9_.]{2,30}$', text):
+        if re.match(r'^\d+$', text):
+            pass  # শুধু সংখ্যা হলে নাম্বার হিসেবে নিচে চেক হবে
+        else:
+            return True
+
+    # ৩. নাম্বার প্যাটার্ন
+    digits_only = re.sub(r'[^\d]', '', text)
+    if len(digits_only) >= 10 and len(digits_only) <= 15:
+        if re.match(r'^[\+\d\s\-\(\)\.]{10,25}$', text):
+            return True
+
+    return False
+
+# ================== ডেটাবেজ ==================
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS clients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            value TEXT NOT NULL,
+            normalized TEXT NOT NULL UNIQUE,
+            client_name TEXT,
+            added_by INTEGER,
+            added_by_name TEXT,
+            added_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def find_client(value):
+    norm = normalize(value)
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT value, client_name, added_by_name, added_at FROM clients WHERE normalized = ?", (norm,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def add_client(value, client_name, added_by, added_by_name):
+    norm = normalize(value)
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute(
+            "INSERT INTO clients (value, normalized, client_name, added_by, added_by_name, added_at) VALUES (?,?,?,?,?,?)",
+            (value, norm, client_name, added_by, added_by_name, fmt_dt(now_bd()))
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False
+
+def list_clients(limit=50):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT value, client_name, added_by_name, added_at FROM clients ORDER BY id DESC LIMIT ?", (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def count_clients():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM clients")
+    n = c.fetchone()[0]
+    conn.close()
+    return n
+
+def get_user_name(uid, uname):
+    return uname or f"User_{uid}"
+
+# ================== কীবোর্ড ==================
+def main_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Count", callback_data="count")],
+        [InlineKeyboardButton("📋 List", callback_data="list_clients")],
+        [InlineKeyboardButton("❓ Help", callback_data="help")],
+    ])
+
+# ================== কমান্ড ==================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    await update.message.reply_text(
+        f"👋 স্বাগতম {u.first_name}!\n\n"
+        f"🔎 শুধু ক্লায়েন্টের নাম্বার বা ইউজারনেম লিখুন — বট অটো চেক করে রিপ্লাই দেবে।\n\n"
+        f"📌 উদাহরণ:\n"
+        f"`@john123`\n"
+        f"`@suliaeva.art`\n"
+        f"`john.doe_123`\n"
+        f"`01712345678`\n"
+        f"`+8801712345678`\n\n"
+        f"✅ নতুন হলে → Yes, can talk + অটো যোগ হবে\n"
+        f"❌ পুরনো হলে → No, Don't talk\n\n"
+        f"💡 কমান্ড:\n"
+        f"/list — ক্লায়েন্ট লিস্ট (Owner)\n"
+        f"/count — মোট ক্লায়েন্ট (Owner)",
+        parse_mode="Markdown",
+        reply_markup=main_menu()
+    )
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("❌ শুধু Owner এই কমান্ড ব্যবহার করতে পারবেন।")
+        return
+    rows = list_clients(50)
+    if not rows:
+        await update.message.reply_text("📭 এখনো কোনো ক্লায়েন্ট যোগ করা হয়নি।")
+        return
+    lines = ["📋 সাম্প্রতিক ৫০ জন ক্লায়েন্ট\n"]
+    for i, (val, cname, added_by, added_at) in enumerate(rows, 1):
+        lines.append(f"{i}. {val} — {cname or '—'}\n   ✍️ {added_by} | {added_at}")
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n\n... (আরও অনেক আছে)"
+    await update.message.reply_text(text)
+
+async def cmd_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("❌ শুধু Owner এই কমান্ড ব্যবহার করতে পারবেন।")
+        return
+    n = count_clients()
+    await update.message.reply_text(f"📊 মোট ক্লায়েন্ট: *{n}*", parse_mode="Markdown")
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
+
+# ================== মূল মেসেজ হ্যান্ডলার ==================
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """স্টাফ শুধু নাম্বার/ইউজারনেম লিখলে বট অটো চেক করে"""
+    if not update.message or not update.message.text:
+        return
+
+    text = update.message.text.strip()
+
+    # কমান্ড হলে এড়িয়ে যাও
+    if text.startswith("/"):
+        return
+
+    # ভ্যালিড নাম্বার/ইউজারনেম কিনা চেক
+    if not is_valid_input(text):
+        return
+
+    u = update.effective_user
+    staff_name = get_user_name(u.id, u.first_name)
+
+    # ডেটাবেজে আছে কিনা দেখো
+    row = find_client(text)
+
+    if row:
+        # পুরনো ক্লায়েন্ট
+        old_value, client_name, added_by, added_at = row
+        await update.message.reply_text(
+            f"❌ *No, Don't talk*\n"
+            f"🕒 This is an OLD ID\n\n"
+            f"📞 যা দিয়েছেন: `{text}`\n"
+            f"🗂 ডেটাবেজে আছে: `{old_value}`\n"
+            f"👤 ক্লায়েন্টের নাম: {client_name or 'অজানা'}\n"
+            f"✍️ যোগ করেছেন: {added_by or 'অজানা'}\n"
+            f"📅 তারিখ: {added_at}",
+            parse_mode="Markdown"
+        )
+    else:
+        # নতুন ক্লায়েন্ট — অটো যোগ করে দাও
+        ok = add_client(text, staff_name, u.id, staff_name)
+        if ok:
+            await update.message.reply_text(
+                f"✅ *Yes, can talk*\n"
+                f"🆕 This is a NEW client\n\n"
+                f"📞 `{text}` — অটো ডেটাবেজে যোগ হয়েছে\n"
+                f"✍️ যোগ করেছেন: {staff_name}\n"
+                f"📅 তারিখ: {fmt_dt(now_bd())}",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ *Yes, can talk*\n"
+                f"🆕 This is a NEW client\n\n"
+                f"📞 `{text}`\n\n"
+                f"⚠️ তবে অটো যোগ করা যায়নি।",
+                parse_mode="Markdown"
+            )
+
+# ================== বাটন হ্যান্ডলার ==================
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+
+    if data == "count":
+        n = count_clients()
+        await q.message.reply_text(f"📊 মোট ক্লায়েন্ট: *{n}*", parse_mode="Markdown")
+    elif data == "list_clients":
+        if not is_owner(q.from_user.id):
+            await q.message.reply_text("❌ শুধু Owner এই কমান্ড ব্যবহার করতে পারবেন।")
+            return
+        rows = list_clients(50)
+        if not rows:
+            await q.message.reply_text("📭 এখনো কোনো ক্লায়েন্ট যোগ করা হয়নি।")
+            return
+        lines = ["📋 সাম্প্রতিক ৫০ জন ক্লায়েন্ট\n"]
+        for i, (val, cname, added_by, added_at) in enumerate(rows, 1):
+            lines.append(f"{i}. {val} — {cname or '—'}\n   ✍️ {added_by} | {added_at}")
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:4000] + "\n\n... (আরও অনেক আছে)"
+        await q.message.reply_text(text)
+    elif data == "help":
+        u = q.from_user
+        await q.message.reply_text(
+            f"👋 {u.first_name}!\n\n"
+            f"🔎 শুধু নাম্বার বা ইউজারনেম লিখুন:\n"
+            f"`@suliaeva.art`\n"
+            f"`john.doe_123`\n"
+            f"`01712345678`\n\n"
+            f"বট অটো চেক করে রিপ্লাই দেবে।",
+            parse_mode="Markdown"
+        )
+
+# ================== main ==================
+def main():
+    logging.basicConfig(level=logging.INFO)
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("count", cmd_count))
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    # মূল ফিচার: যেকোনো টেক্সট মেসেজ হ্যান্ডল করবে
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    print("🤖 Number Check Bot চালু হয়েছে...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
