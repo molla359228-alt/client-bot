@@ -3,6 +3,8 @@ import re
 import sqlite3
 import os
 from datetime import datetime
+from threading import Thread
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -16,6 +18,22 @@ OWNER_ID  = 7495790113
 
 BD_TZ = pytz.timezone("Asia/Dhaka")
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clients.db")
+
+# ================== 🌐 Render-এর জন্য ডামি HTTP সার্ভার ==================
+web_app = Flask(__name__)
+
+@web_app.route('/')
+def home():
+    return "✅ Number Check Bot is running!", 200
+
+@web_app.route('/health')
+def health():
+    return "OK", 200
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    logging.info(f"Starting web server on port {port}...")
+    web_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 # ================== হেল্পার ==================
 def now_bd():
@@ -45,33 +63,24 @@ def normalize(value):
     return v
 
 def is_valid_input(text):
-    """
-    টেক্সট নাম্বার বা ইউজারনেম কিনা যাচাই:
-    - Instagram username: ডট, আন্ডারস্কোর, সংখ্যা সহ (২-৩০ অক্ষর)
-    - @username (ডট সহ) যেমন: @suliaeva.art
-    - নাম্বার (১০-১৫ ডিজিট, +88, 88, +880 সহ)
-    """
     if not text:
         return False
     text = text.strip()
     if len(text) > 50 or len(text) < 2:
         return False
 
-    # ১. @username প্যাটার্ন (ডট, আন্ডারস্কোর সহ)
     if text.startswith("@"):
         username = text[1:]
         if 2 <= len(username) <= 30:
             if re.match(r'^[a-zA-Z0-9_.]+$', username):
                 return True
 
-    # ২. username প্যাটার্ন (@ ছাড়া, ডট সহ)
     if re.match(r'^[a-zA-Z0-9_.]{2,30}$', text):
         if re.match(r'^\d+$', text):
-            pass  # শুধু সংখ্যা হলে নাম্বার হিসেবে নিচে চেক হবে
+            pass
         else:
             return True
 
-    # ৩. নাম্বার প্যাটার্ন
     digits_only = re.sub(r'[^\d]', '', text)
     if len(digits_only) >= 10 and len(digits_only) <= 15:
         if re.match(r'^[\+\d\s\-\(\)\.]{10,25}$', text):
@@ -198,28 +207,23 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================== মূল মেসেজ হ্যান্ডলার ==================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """স্টাফ শুধু নাম্বার/ইউজারনেম লিখলে বট অটো চেক করে"""
     if not update.message or not update.message.text:
         return
 
     text = update.message.text.strip()
 
-    # কমান্ড হলে এড়িয়ে যাও
     if text.startswith("/"):
         return
 
-    # ভ্যালিড নাম্বার/ইউজারনেম কিনা চেক
     if not is_valid_input(text):
         return
 
     u = update.effective_user
     staff_name = get_user_name(u.id, u.first_name)
 
-    # ডেটাবেজে আছে কিনা দেখো
     row = find_client(text)
 
     if row:
-        # পুরনো ক্লায়েন্ট
         old_value, client_name, added_by, added_at = row
         await update.message.reply_text(
             f"❌ *No, Don't talk*\n"
@@ -232,7 +236,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
     else:
-        # নতুন ক্লায়েন্ট — অটো যোগ করে দাও
         ok = add_client(text, staff_name, u.id, staff_name)
         if ok:
             await update.message.reply_text(
@@ -292,6 +295,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     logging.basicConfig(level=logging.INFO)
     init_db()
+
+    # 🌐 প্রথমে ডামি HTTP সার্ভার চালু
+    logging.info("Starting web server for Render...")
+    t = Thread(target=run_web)
+    t.daemon = True
+    t.start()
+
+    # 🤖 তারপর বট চালু
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -299,8 +310,6 @@ def main():
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("count", cmd_count))
     app.add_handler(CallbackQueryHandler(button_handler))
-
-    # মূল ফিচার: যেকোনো টেক্সট মেসেজ হ্যান্ডল করবে
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("🤖 Number Check Bot চালু হয়েছে...")
