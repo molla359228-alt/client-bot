@@ -2,6 +2,7 @@ import logging
 import re
 import sqlite3
 import os
+from collections import OrderedDict
 from datetime import datetime
 from threading import Thread
 from flask import Flask
@@ -41,6 +42,17 @@ def now_bd():
 
 def fmt_dt(dt):
     return dt.strftime("%d %b %Y, %I:%M %p")
+
+def fmt_date(dt):
+    return dt.strftime("%Y-%m-%d")
+
+def fmt_date_display(date_str):
+    """YYYY-MM-DD -> 23 Sep 2026 (দেখানোর জন্য সুন্দর ফরম্যাট)"""
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d")
+        return d.strftime("%d %b %Y")
+    except (ValueError, TypeError):
+        return date_str or "অজানা তারিখ"
 
 def is_owner(user_id):
     return user_id == OWNER_ID
@@ -100,10 +112,19 @@ def init_db():
             client_name TEXT,
             added_by INTEGER,
             added_by_name TEXT,
-            added_at TEXT
+            added_at TEXT,
+            added_date TEXT
         )
     """)
     conn.commit()
+
+    # পুরনো ডেটাবেজে added_date কলাম না থাকলে যোগ করে দাও (migration)
+    c.execute("PRAGMA table_info(clients)")
+    existing_columns = [row[1] for row in c.fetchall()]
+    if "added_date" not in existing_columns:
+        c.execute("ALTER TABLE clients ADD COLUMN added_date TEXT")
+        conn.commit()
+
     conn.close()
 
 def find_client(value):
@@ -120,9 +141,11 @@ def add_client(value, client_name, added_by, added_by_name):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     try:
+        now = now_bd()
         c.execute(
-            "INSERT INTO clients (value, normalized, client_name, added_by, added_by_name, added_at) VALUES (?,?,?,?,?,?)",
-            (value, norm, client_name, added_by, added_by_name, fmt_dt(now_bd()))
+            "INSERT INTO clients (value, normalized, client_name, added_by, added_by_name, added_at, added_date) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (value, norm, client_name, added_by, added_by_name, fmt_dt(now), fmt_date(now))
         )
         conn.commit()
         conn.close()
@@ -147,14 +170,83 @@ def count_clients():
     conn.close()
     return n
 
+def get_daily_breakdown():
+    """প্রতিটা তারিখে কোন স্টাফ কতগুলো ক্লায়েন্ট যোগ করেছে, তার raw ডেটা।"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        SELECT added_date, added_by_name, COUNT(*) as cnt
+        FROM clients
+        WHERE added_date IS NOT NULL AND added_date != ''
+        GROUP BY added_date, added_by_name
+        ORDER BY added_date DESC, cnt DESC
+    """)
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_staff_totals():
+    """সব সময় মিলিয়ে প্রতিটা স্টাফ মোট কতগুলো ক্লায়েন্ট যোগ করেছে।"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        SELECT added_by_name, COUNT(*) as cnt
+        FROM clients
+        GROUP BY added_by_name
+        ORDER BY cnt DESC
+    """)
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
 def get_user_name(uid, uname):
     return uname or f"User_{uid}"
+
+# ================== রিপোর্ট টেক্সট তৈরি ==================
+def build_daily_report_text(limit_days=14):
+    rows = get_daily_breakdown()
+    if not rows:
+        return "📭 এখনো তারিখভিত্তিক কোনো ডেটা নেই।"
+
+    grouped = OrderedDict()
+    for date_str, staff_name, cnt in rows:
+        grouped.setdefault(date_str, []).append((staff_name or "Unknown", cnt))
+
+    lines = [f"📅 *দৈনিক রিপোর্ট* (সাম্প্রতিক {limit_days} দিন)\n"]
+    for i, (date_str, staff_list) in enumerate(grouped.items()):
+        if i >= limit_days:
+            break
+        total = sum(cnt for _, cnt in staff_list)
+        lines.append(f"\n🗓 {fmt_date_display(date_str)} — মোট: *{total}*")
+        for staff_name, cnt in staff_list:
+            lines.append(f"   • {staff_name}: {cnt}")
+
+    return "\n".join(lines)
+
+def build_staff_report_text():
+    rows = get_staff_totals()
+    if not rows:
+        return "📭 এখনো কোনো ডেটা যোগ হয়নি।"
+
+    grand_total = sum(cnt for _, cnt in rows)
+    lines = [f"🧑‍💼 *স্টাফ অনুযায়ী মোট যোগ করা ক্লায়েন্ট* (সর্বমোট: {grand_total})\n"]
+    for i, (staff_name, cnt) in enumerate(rows, 1):
+        lines.append(f"{i}. {staff_name or 'Unknown'}: {cnt}")
+
+    return "\n".join(lines)
+
+def send_long_text(text, limit=4000):
+    if len(text) > limit:
+        return text[:limit] + "\n\n... (আরও আছে)"
+    return text
 
 # ================== কীবোর্ড ==================
 def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Count", callback_data="count")],
         [InlineKeyboardButton("📋 List", callback_data="list_clients")],
+        [InlineKeyboardButton("📅 Daily Report", callback_data="daily_report")],
+        [InlineKeyboardButton("🧑‍💼 Staff Report", callback_data="staff_report")],
         [InlineKeyboardButton("❓ Help", callback_data="help")],
     ])
 
@@ -174,7 +266,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"❌ পুরনো হলে → No, Don't talk\n\n"
         f"💡 কমান্ড:\n"
         f"/list — ক্লায়েন্ট লিস্ট (Owner)\n"
-        f"/count — মোট ক্লায়েন্ট (Owner)",
+        f"/count — মোট ক্লায়েন্ট (Owner)\n"
+        f"/report — দৈনিক রিপোর্ট, প্রতিদিন কে কতগুলো যোগ করেছে (Owner)\n"
+        f"/staff — স্টাফ অনুযায়ী মোট হিসাব (Owner)",
         parse_mode="Markdown",
         reply_markup=main_menu()
     )
@@ -190,9 +284,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["📋 সাম্প্রতিক ৫০ জন ক্লায়েন্ট\n"]
     for i, (val, cname, added_by, added_at) in enumerate(rows, 1):
         lines.append(f"{i}. {val} — {cname or '—'}\n   ✍️ {added_by} | {added_at}")
-    text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:4000] + "\n\n... (আরও অনেক আছে)"
+    text = send_long_text("\n".join(lines))
     await update.message.reply_text(text)
 
 async def cmd_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -201,6 +293,20 @@ async def cmd_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     n = count_clients()
     await update.message.reply_text(f"📊 মোট ক্লায়েন্ট: *{n}*", parse_mode="Markdown")
+
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("❌ শুধু Owner এই কমান্ড ব্যবহার করতে পারবেন।")
+        return
+    text = send_long_text(build_daily_report_text())
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def cmd_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("❌ শুধু Owner এই কমান্ড ব্যবহার করতে পারবেন।")
+        return
+    text = send_long_text(build_staff_report_text())
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
@@ -264,6 +370,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "count":
         n = count_clients()
         await q.message.reply_text(f"📊 মোট ক্লায়েন্ট: *{n}*", parse_mode="Markdown")
+
     elif data == "list_clients":
         if not is_owner(q.from_user.id):
             await q.message.reply_text("❌ শুধু Owner এই কমান্ড ব্যবহার করতে পারবেন।")
@@ -275,10 +382,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = ["📋 সাম্প্রতিক ৫০ জন ক্লায়েন্ট\n"]
         for i, (val, cname, added_by, added_at) in enumerate(rows, 1):
             lines.append(f"{i}. {val} — {cname or '—'}\n   ✍️ {added_by} | {added_at}")
-        text = "\n".join(lines)
-        if len(text) > 4000:
-            text = text[:4000] + "\n\n... (আরও অনেক আছে)"
+        text = send_long_text("\n".join(lines))
         await q.message.reply_text(text)
+
+    elif data == "daily_report":
+        if not is_owner(q.from_user.id):
+            await q.message.reply_text("❌ শুধু Owner এই কমান্ড ব্যবহার করতে পারবেন।")
+            return
+        text = send_long_text(build_daily_report_text())
+        await q.message.reply_text(text, parse_mode="Markdown")
+
+    elif data == "staff_report":
+        if not is_owner(q.from_user.id):
+            await q.message.reply_text("❌ শুধু Owner এই কমান্ড ব্যবহার করতে পারবেন।")
+            return
+        text = send_long_text(build_staff_report_text())
+        await q.message.reply_text(text, parse_mode="Markdown")
+
     elif data == "help":
         u = q.from_user
         await q.message.reply_text(
@@ -309,6 +429,8 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("count", cmd_count))
+    app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("staff", cmd_staff))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
