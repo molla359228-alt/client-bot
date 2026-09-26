@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import logging
 import re
 import sqlite3
@@ -14,8 +15,10 @@ from telegram.ext import (
 import pytz
 
 # ================== কনফিগারেশন ==================
-BOT_TOKEN = "8831118670:AAEmmtkN7uOfMDYM-w72H2gj518zCztptug"
-OWNER_ID  = 7495790113
+# ⚠️ টোকেন এখন Environment Variable থেকে পড়া হবে
+# Render → Environment → NUMBER_CHECK_BOT_TOKEN = (আপনার নতুন টোকেন)
+BOT_TOKEN = os.getenv("NUMBER_CHECK_BOT_TOKEN", "8831118670:AAEmmtkN7uOfMDYM-w72H2gj518zCztptug")
+OWNER_ID = int(os.getenv("OWNER_ID", "7495790113"))
 
 BD_TZ = pytz.timezone("Asia/Dhaka")
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clients.db")
@@ -23,28 +26,35 @@ DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clients.db")
 # ================== 🌐 Render-এর জন্য ডামি HTTP সার্ভার ==================
 web_app = Flask(__name__)
 
+
 @web_app.route('/')
 def home():
     return "✅ Number Check Bot is running!", 200
 
+
 @web_app.route('/health')
 def health():
     return "OK", 200
+
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
     logging.info(f"Starting web server on port {port}...")
     web_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
+
 # ================== হেল্পার ==================
 def now_bd():
     return datetime.now(BD_TZ)
 
+
 def fmt_dt(dt):
     return dt.strftime("%d %b %Y, %I:%M %p")
 
+
 def fmt_date(dt):
     return dt.strftime("%Y-%m-%d")
+
 
 def fmt_date_display(date_str):
     """YYYY-MM-DD -> 23 Sep 2026 (দেখানোর জন্য সুন্দর ফরম্যাট)"""
@@ -54,8 +64,10 @@ def fmt_date_display(date_str):
     except (ValueError, TypeError):
         return date_str or "অজানা তারিখ"
 
+
 def is_owner(user_id):
     return user_id == OWNER_ID
+
 
 def normalize(value):
     """নাম্বার/ইউজারনেম নরমালাইজ - @, +88, স্পেস, ড্যাশ বাদ"""
@@ -74,31 +86,42 @@ def normalize(value):
         v = v[2:]
     return v
 
+
 def is_valid_input(text):
+    """
+    সব ধরনের ইনপুট গ্রহণ করে:
+    - @username (Telegram স্টাইল)
+    - username (ড্যাশ, আন্ডারস্কোর, ডট সহ)
+    - ফোন নাম্বার (যেকোনো ফরম্যাটে)
+    """
     if not text:
         return False
     text = text.strip()
     if len(text) > 50 or len(text) < 2:
         return False
 
+    # ১. @username — Telegram স্টাইল
     if text.startswith("@"):
         username = text[1:]
-        if 2 <= len(username) <= 30:
-            if re.match(r'^[a-zA-Z0-9_.]+$', username):
+        if 2 <= len(username) <= 32:
+            if re.match(r'^[a-zA-Z0-9_]+$', username):
                 return True
+        return False
 
-    if re.match(r'^[a-zA-Z0-9_.]{2,30}$', text):
-        if re.match(r'^\d+$', text):
-            pass
-        else:
+    # ২. username — ড্যাশ, আন্ডারস্কোর, ডট সহ
+    if re.match(r'^[a-zA-Z0-9_.\-]{2,32}$', text):
+        # শুধু ডিজিট না হলে ইউজারনেম হিসেবে ধরব
+        if not re.match(r'^\d+$', text):
             return True
 
+    # ৩. ফোন নাম্বার — যেকোনো ফরম্যাটে
     digits_only = re.sub(r'[^\d]', '', text)
-    if len(digits_only) >= 10 and len(digits_only) <= 15:
-        if re.match(r'^[\+\d\s\-\(\)\.]{10,25}$', text):
+    if 8 <= len(digits_only) <= 15:
+        if re.match(r'^[\+\d\s\-\(\)\.]{8,25}$', text):
             return True
 
     return False
+
 
 # ================== ডেটাবেজ ==================
 def init_db():
@@ -127,14 +150,19 @@ def init_db():
 
     conn.close()
 
+
 def find_client(value):
     norm = normalize(value)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT value, client_name, added_by_name, added_at FROM clients WHERE normalized = ?", (norm,))
+    c.execute(
+        "SELECT value, client_name, added_by_name, added_at FROM clients WHERE normalized = ?",
+        (norm,)
+    )
     row = c.fetchone()
     conn.close()
     return row
+
 
 def add_client(value, client_name, added_by, added_by_name):
     norm = normalize(value)
@@ -154,13 +182,18 @@ def add_client(value, client_name, added_by, added_by_name):
         conn.close()
         return False
 
+
 def list_clients(limit=50):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT value, client_name, added_by_name, added_at FROM clients ORDER BY id DESC LIMIT ?", (limit,))
+    c.execute(
+        "SELECT value, client_name, added_by_name, added_at FROM clients ORDER BY id DESC LIMIT ?",
+        (limit,)
+    )
     rows = c.fetchall()
     conn.close()
     return rows
+
 
 def count_clients():
     conn = sqlite3.connect(DB_FILE)
@@ -169,6 +202,7 @@ def count_clients():
     n = c.fetchone()[0]
     conn.close()
     return n
+
 
 def get_daily_breakdown():
     """প্রতিটা তারিখে কোন স্টাফ কতগুলো ক্লায়েন্ট যোগ করেছে, তার raw ডেটা।"""
@@ -185,6 +219,7 @@ def get_daily_breakdown():
     conn.close()
     return rows
 
+
 def get_staff_totals():
     """সব সময় মিলিয়ে প্রতিটা স্টাফ মোট কতগুলো ক্লায়েন্ট যোগ করেছে।"""
     conn = sqlite3.connect(DB_FILE)
@@ -199,8 +234,10 @@ def get_staff_totals():
     conn.close()
     return rows
 
+
 def get_user_name(uid, uname):
     return uname or f"User_{uid}"
+
 
 # ================== রিপোর্ট টেক্সট তৈরি ==================
 def build_daily_report_text(limit_days=14):
@@ -223,6 +260,7 @@ def build_daily_report_text(limit_days=14):
 
     return "\n".join(lines)
 
+
 def build_staff_report_text():
     rows = get_staff_totals()
     if not rows:
@@ -235,10 +273,12 @@ def build_staff_report_text():
 
     return "\n".join(lines)
 
+
 def send_long_text(text, limit=4000):
     if len(text) > limit:
         return text[:limit] + "\n\n... (আরও আছে)"
     return text
+
 
 # ================== কীবোর্ড ==================
 def main_menu():
@@ -250,6 +290,7 @@ def main_menu():
         [InlineKeyboardButton("❓ Help", callback_data="help")],
     ])
 
+
 # ================== কমান্ড ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -260,6 +301,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"`@john123`\n"
         f"`@suliaeva.art`\n"
         f"`john.doe_123`\n"
+        f"`bilal-iffik2310`\n"
         f"`01712345678`\n"
         f"`+8801712345678`\n\n"
         f"✅ নতুন হলে → Yes, can talk + অটো যোগ হবে\n"
@@ -272,6 +314,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=main_menu()
     )
+
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
@@ -287,12 +330,14 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = send_long_text("\n".join(lines))
     await update.message.reply_text(text)
 
+
 async def cmd_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         await update.message.reply_text("❌ শুধু Owner এই কমান্ড ব্যবহার করতে পারবেন।")
         return
     n = count_clients()
     await update.message.reply_text(f"📊 মোট ক্লায়েন্ট: *{n}*", parse_mode="Markdown")
+
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
@@ -301,6 +346,7 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = send_long_text(build_daily_report_text())
     await update.message.reply_text(text, parse_mode="Markdown")
 
+
 async def cmd_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         await update.message.reply_text("❌ শুধু Owner এই কমান্ড ব্যবহার করতে পারবেন।")
@@ -308,8 +354,10 @@ async def cmd_staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = send_long_text(build_staff_report_text())
     await update.message.reply_text(text, parse_mode="Markdown")
 
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
+
 
 # ================== মূল মেসেজ হ্যান্ডলার ==================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -318,11 +366,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
+    # Debug log
+    logging.info(f"📨 Received: '{text}' from user {update.effective_user.id}")
+
     if text.startswith("/"):
         return
 
     if not is_valid_input(text):
+        logging.warning(f"❌ Invalid input: '{text}'")
+        await update.message.reply_text(
+            "⚠️ *সঠিক ফরম্যাটে পাঠান*\n\n"
+            "📌 উদাহরণ:\n"
+            "`@john123`\n"
+            "`@suliaeva.art`\n"
+            "`john.doe_123`\n"
+            "`bilal-iffik2310`\n"
+            "`01712345678`\n"
+            "`+8801712345678`",
+            parse_mode="Markdown"
+        )
         return
+
+    logging.info(f"✅ Valid input: '{text}'")
 
     u = update.effective_user
     staff_name = get_user_name(u.id, u.first_name)
@@ -360,6 +425,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⚠️ তবে অটো যোগ করা যায়নি।",
                 parse_mode="Markdown"
             )
+
 
 # ================== বাটন হ্যান্ডলার ==================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -406,14 +472,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔎 শুধু নাম্বার বা ইউজারনেম লিখুন:\n"
             f"`@suliaeva.art`\n"
             f"`john.doe_123`\n"
+            f"`bilal-iffik2310`\n"
             f"`01712345678`\n\n"
             f"বট অটো চেক করে রিপ্লাই দেবে।",
             parse_mode="Markdown"
         )
 
+
 # ================== main ==================
 def main():
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=logging.INFO
+    )
     init_db()
 
     # 🌐 প্রথমে ডামি HTTP সার্ভার চালু
@@ -435,7 +506,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("🤖 Number Check Bot চালু হয়েছে...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
